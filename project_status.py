@@ -278,6 +278,13 @@ def process_repo(repo: Path) -> dict:
     did_backup = False
     backup_branch_name = None
 
+    # --- already on a backup branch: treat as BACKUPED, no action needed ---
+    if current_branch.startswith("backup-"):
+        result["backup_branch"] = current_branch
+        result["notes"].append("already on backup branch, pending manual review")
+        result["status"] = BACKUPED
+        return _apply_remote_status(result, remote)
+
     # --- fetch if remote exists ---
     if remote:
         rc, _, err = git(["fetch", "--all", "--prune"], cwd=repo, timeout=GIT_FETCH_TIMEOUT)
