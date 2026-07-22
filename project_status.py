@@ -3,8 +3,12 @@
 project_status.py — Scan and clean up git projects under PROJECT_FOLDER.
 
 Env vars:
-  PROJECT_FOLDER        Root directory to scan (default: $HOME/projects)
-  PROJECT_FOLDER_MODEL  pi model for commit messages (default: bob/haiku-4.5)
+  PROJECT_FOLDER         Root directory to scan (default: $HOME/projects)
+  PROJECT_FOLDER_MODEL   pi model for commit messages (default: bob/haiku-4.5)
+  PROJECT_FOLDER_NOPUSH  Colon-separated dirs: pull only, local changes overwritten, no push
+                         (recursive — any repo under these paths is affected)
+  PROJECT_FOLDER_IGNORE  Colon-separated dirs: skip entirely, no operation at all
+                         (recursive — any repo under these paths is skipped)
 """
 
 import os
@@ -20,6 +24,40 @@ from typing import Optional
 
 PROJECT_FOLDER = Path(os.environ.get("PROJECT_FOLDER", Path.home() / "projects"))
 PROJECT_FOLDER_MODEL = os.environ.get("PROJECT_FOLDER_MODEL", "bob/haiku-4.5")
+
+
+def _parse_path_list(env_var: str) -> list[Path]:
+    """Parse a colon-separated list of paths from an env var, expanding ~ and making absolute."""
+    raw = os.environ.get(env_var, "")
+    if not raw.strip():
+        return []
+    paths = []
+    for p in raw.split(":"):
+        p = p.strip()
+        if not p:
+            continue
+        expanded = Path(p).expanduser()
+        # If relative, resolve against PROJECT_FOLDER
+        if not expanded.is_absolute():
+            expanded = PROJECT_FOLDER / expanded
+        paths.append(expanded.resolve())
+    return paths
+
+
+NOPUSH_FOLDERS = _parse_path_list("PROJECT_FOLDER_NOPUSH")
+IGNORE_FOLDERS = _parse_path_list("PROJECT_FOLDER_IGNORE")
+
+
+def is_under(path: Path, folders: list[Path]) -> bool:
+    """Return True if path is equal to or under any of the given folders."""
+    try:
+        resolved = path.resolve()
+    except Exception:
+        return False
+    return any(
+        resolved == f or resolved.is_relative_to(f)
+        for f in folders
+    )
 
 PROTECTED_BRANCHES = {
     "main", "master", "uat", "develop", "tests", "staging",
@@ -86,6 +124,10 @@ def discover(root: Path) -> tuple[list[Path], list[Path]]:
 
     def _walk(path: Path) -> bool:
         """Returns True if this subtree contains at least one git repo."""
+        # Skip entirely if under IGNORE_FOLDERS
+        if is_under(path, IGNORE_FOLDERS):
+            return False
+
         if (path / ".git").exists():
             git_repos.append(path)
             return True
@@ -229,6 +271,7 @@ def process_repo(repo: Path) -> dict:
         "notes": [],
     }
 
+    nopush = is_under(repo, NOPUSH_FOLDERS)
     current_branch = get_current_branch(repo)
     result["active_branch"] = current_branch
     remote = has_remote(repo)
@@ -260,7 +303,7 @@ def process_repo(repo: Path) -> dict:
             stage_and_commit(repo, generate_commit_message)
             did_backup = True
 
-            if remote:
+            if remote and not nopush:
                 rc, _, err = git(
                     ["push", "--set-upstream", "origin", backup_branch_name], cwd=repo
                 )
@@ -294,7 +337,7 @@ def process_repo(repo: Path) -> dict:
                             result["status"] = BACKUP_DIRTY
                         else:
                             result["status"] = BACKUPED
-                            if remote:
+                            if not nopush:
                                 git(["push", "--force-with-lease", "origin", backup_branch_name], cwd=repo)
                     result["active_branch"] = current_branch
                     result["backup_branch"] = backup_branch_name
@@ -326,9 +369,10 @@ def process_repo(repo: Path) -> dict:
                         result["notes"].append(f"rebase failed after commit: {err}")
                         result["status"] = BACKUP_DIRTY
                         return _apply_remote_status(result, remote)
-                rc, _, err = git(["push", "--set-upstream", "origin", current_branch], cwd=repo)
-                if rc != 0:
-                    result["notes"].append(f"push failed: {err}")
+                if not nopush:
+                    rc, _, err = git(["push", "--set-upstream", "origin", current_branch], cwd=repo)
+                    if rc != 0:
+                        result["notes"].append(f"push failed: {err}")
 
             result["status"] = BACKUPED
 
